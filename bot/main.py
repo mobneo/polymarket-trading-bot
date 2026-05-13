@@ -9,8 +9,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
 
 from bot.config import config
-from bot.keyboards import main_keyboard, market_actions_keyboard, markets_keyboard, balance_keyboard, approve_confirmation_keyboard
+from bot.keyboards import main_keyboard, market_actions_keyboard, markets_keyboard, balance_keyboard, approve_confirmation_keyboard, get_hourly_market_keyboard
 from bot.polymarket_client import PolymarketClient
+from bot.hourly_market import HourlyBitcoinMarket, get_time_until_expiry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,11 @@ class OrderForm(StatesGroup):
     waiting_size = State()
 
 
+class HourlyOrderForm(StatesGroup):
+    waiting_price = State()
+    waiting_size = State()
+
+
 async def is_admin(message: Message) -> bool:
     if message.from_user.id != config.ADMIN_ID:
         await message.answer("⛔ Access denied")
@@ -45,10 +51,31 @@ async def safe_edit_text(message, text, parse_mode="HTML", reply_markup=None):
         else:
             raise e
 
+# Global variable for hourly market
+current_hourly_market = HourlyBitcoinMarket(client)
+
+async def check_and_switch_market():
+    """Background task to check for market expiry and switch to new hour"""
+    global current_hourly_market
+    while True:
+        try:
+            time_left = get_time_until_expiry()
+            # If less than 60 seconds are left, refresh market for next hour
+            if time_left.total_seconds() < 60:
+                logger.info("Market expiring soon. Refreshing market data for the new hour...")
+                current_hourly_market = HourlyBitcoinMarket(client)
+                logger.info(f"Switched to new market: {current_hourly_market.slug}")
+            await asyncio.sleep(30)  # Check every 30 seconds
+        except Exception as e:
+            logger.error(f"Error in market switching task: {e}")
+            await asyncio.sleep(60)
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not await is_admin(message):
         return
+    # Start background task
+    asyncio.create_task(check_and_switch_market())
     await message.answer(
         "🤖 Polymarket Trading Bot\nSelect an action:",
         reply_markup=main_keyboard(),
@@ -61,6 +88,38 @@ async def show_markets(message: Message):
         return
     markets = client.get_markets(20)
     await message.answer("📊 Available markets:", reply_markup=markets_keyboard(markets))
+
+
+@dp.message(F.text == "📊 Hourly BTC Market")
+async def show_hourly_btc(message: Message):
+    """Display current hourly BTC market information"""
+    if not await is_admin(message):
+        return
+    try:
+        market_info = current_hourly_market.get_market_info()
+        if not market_info:
+            await message.answer("❌ Could not find the current hourly market. Please try again later.")
+            return
+
+        # Get pUSD balance to show available funds
+        balance_info = client.get_wallet_balance()
+        platform_balance = balance_info.get('platform_balance_formatted', 0) if balance_info else 0
+
+        text = (
+            f"📈 <b>Bitcoin Up or Down - Hourly</b>\n\n"
+            f"🎯 <b>Current Hour:</b> {market_info['slug'].replace('bitcoin-up-or-down-', '').replace('-et', '').replace('-', ' ').title()}\n"
+            f"⏳ <b>Time Left:</b> {market_info['time_left']}\n"
+            f"🕒 <b>Expires At:</b> {market_info['expires_at']}\n\n"
+            f"💰 <b>Current Prices:</b>\n"
+            f"   🟢 <b>YES</b> - Bid: {market_info['yes_bid']:.4f} / Ask: {market_info['yes_ask']:.4f}\n"
+            f"   🔴 <b>NO</b>  - Bid: {market_info['no_bid']:.4f} / Ask: {market_info['no_ask']:.4f}\n\n"
+            f"💳 <b>Available Platform Balance:</b> {platform_balance:.2f} pUSD\n\n"
+            f"💡 <i>Click buttons below to place orders</i>"
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=get_hourly_market_keyboard())
+    except Exception as e:
+        logger.error(f"Error showing hourly BTC: {e}")
+        await message.answer(f"❌ Error fetching market data: {e}")
 
 
 @dp.message(F.text == "💰 Balance")
@@ -78,7 +137,6 @@ async def show_balance(message: Message):
             pusd_balance = balance_info.get('pusd_balance', 0)
             pusd_balance_formatted = pusd_balance / 1e6 if pusd_balance else 0
 
-            # Platform balance is already in pUSD
             platform_balance = balance_info.get('platform_balance', 0)
             platform_balance_formatted = platform_balance / 1e6 if platform_balance else 0
 
@@ -116,7 +174,6 @@ async def show_balance(message: Message):
             balance_allowance = client.get_balance_allowance()
             text = f"💰 Balance:\n<b>{balance_allowance.get('balance', '0')} USDC</b>"
 
-        # For new messages, use answer (not edit)
         await message.answer(text, parse_mode="HTML", reply_markup=balance_keyboard())
 
     except Exception as e:
@@ -137,7 +194,6 @@ async def check_balance(callback: CallbackQuery):
             pusd_balance = balance_info.get('pusd_balance', 0)
             pusd_balance_formatted = pusd_balance / 1e6 if pusd_balance else 0
 
-            # Get platform balance - this should show pUSD
             platform_balance = balance_info.get('platform_balance', 0)
             platform_balance_formatted = platform_balance / 1e6 if platform_balance else 0
 
@@ -172,7 +228,6 @@ async def check_balance(callback: CallbackQuery):
             balance_allowance = client.get_balance_allowance()
             text = f"💰 Balance:\n<b>{balance_allowance.get('balance', '0')} USDC</b>"
 
-        # Use safe edit instead of direct edit
         await safe_edit_text(callback.message, text, parse_mode="HTML", reply_markup=balance_keyboard())
 
     except Exception as e:
@@ -217,6 +272,138 @@ async def check_approvals(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Error checking approvals: {e}")
         await callback.message.answer(f"❌ Error: {e}")
+
+# --- Hourly Market Order Handlers ---
+
+@dp.callback_query(F.data == "refresh_hourly_market")
+async def refresh_hourly_market(callback: CallbackQuery):
+    """Refresh the hourly market display"""
+    await callback.answer("Refreshing market data...")
+    global current_hourly_market
+    current_hourly_market = HourlyBitcoinMarket(client)
+    await show_hourly_btc(callback.message)
+
+
+@dp.callback_query(F.data.startswith("hourly_buy_"))
+async def start_hourly_buy(callback: CallbackQuery, state: FSMContext):
+    """Start buy order for hourly market"""
+    outcome = callback.data.split("_")[2]  # 'yes' or 'no'
+    await state.update_data(
+        outcome=outcome,
+        side="BUY",
+        market_slug=current_hourly_market.slug
+    )
+    await state.set_state(HourlyOrderForm.waiting_price)
+    await callback.message.answer(f"🟢 BUY {outcome.upper()}\nEnter price (0-1):")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("hourly_sell_"))
+async def start_hourly_sell(callback: CallbackQuery, state: FSMContext):
+    """Start sell order for hourly market"""
+    outcome = callback.data.split("_")[2]  # 'yes' or 'no'
+    await state.update_data(
+        outcome=outcome,
+        side="SELL",
+        market_slug=current_hourly_market.slug
+    )
+    await state.set_state(HourlyOrderForm.waiting_price)
+    await callback.message.answer(f"🔴 SELL {outcome.upper()}\nEnter price (0-1):")
+    await callback.answer()
+
+
+@dp.message(HourlyOrderForm.waiting_price)
+async def process_hourly_price(message: Message, state: FSMContext):
+    """Process price input for hourly market order"""
+    try:
+        price = float(message.text)
+        if not 0 <= price <= 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Invalid price. Please enter a number between 0 and 1:")
+        return
+
+    await state.update_data(price=price)
+    await state.set_state(HourlyOrderForm.waiting_size)
+    await message.answer(f"Price: {price}\nEnter quantity in pUSD (e.g., 10):")
+
+
+@dp.message(HourlyOrderForm.waiting_size)
+async def process_hourly_size(message: Message, state: FSMContext):
+    """Process size input and place hourly market order"""
+    try:
+        size = float(message.text)
+        if size <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Invalid quantity. Please enter a positive number:")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    # Get current market (in case it changed)
+    hourly_market = HourlyBitcoinMarket(client)
+
+    # Get CLOB token IDs from the market
+    clob_token_ids = hourly_market.get_clob_token_ids()
+    if not clob_token_ids or len(clob_token_ids) < 2:
+        await message.answer("❌ Could not get token IDs for the market.")
+        return
+
+    # Select token: first for "Yes", second for "No"
+    token_id = None
+    if data['outcome'] == 'yes':
+        token_id = clob_token_ids[0]
+    else:  # outcome == 'no'
+        token_id = clob_token_ids[1]
+
+    if not token_id:
+        await message.answer("❌ Could not find token ID for the selected outcome.")
+        return
+
+    # Convert size to integer (pUSD has 6 decimals)
+    size_in_wei = int(size * 1e6)
+
+    try:
+        result = client.place_order(
+            token_id=token_id,
+            price=data['price'],
+            size=size_in_wei,
+            side=data['side'],
+        )
+
+        # Calculate cost/return
+        if data['side'] == "BUY":
+            cost = size * data['price']
+            text = (
+                f"✅ <b>Order placed successfully!</b>\n\n"
+                f"📊 Market: BTC Hourly\n"
+                f"🎯 Outcome: {data['outcome'].upper()}\n"
+                f"📈 Side: {data['side']}\n"
+                f"💰 Price: {data['price']:.4f}\n"
+                f"📦 Size: {size:.2f} pUSD\n"
+                f"💸 Total Cost: {cost:.2f} pUSD\n\n"
+                f"🆔 Order ID: <code>{result.get('id', 'N/A')[:20]}...</code>"
+            )
+        else:
+            return_val = size * data['price']
+            text = (
+                f"✅ <b>Order placed successfully!</b>\n\n"
+                f"📊 Market: BTC Hourly\n"
+                f"🎯 Outcome: {data['outcome'].upper()}\n"
+                f"📉 Side: {data['side']}\n"
+                f"💰 Price: {data['price']:.4f}\n"
+                f"📦 Size: {size:.2f} pUSD\n"
+                f"💰 Return if filled: {return_val:.2f} pUSD\n\n"
+                f"🆔 Order ID: <code>{result.get('id', 'N/A')[:20]}...</code>"
+            )
+
+        await message.answer(text, parse_mode="HTML", reply_markup=main_keyboard())
+
+    except Exception as e:
+        logger.error(f"Error placing hourly order: {e}")
+        await message.answer(f"❌ Order failed: {str(e)}", reply_markup=main_keyboard())
 
 @dp.callback_query(F.data == "approve_usdc")
 async def approve_usdc_request(callback: CallbackQuery):

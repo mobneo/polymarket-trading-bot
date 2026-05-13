@@ -1,5 +1,6 @@
 import os
 import time
+from typing import Any, Dict, Optional
 from py_clob_client_v2 import ClobClient, ApiCreds
 from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams, OrderArgs, OrderType
 import logging
@@ -140,6 +141,19 @@ class PolymarketClient:
 
         logger.error(f"Transaction not confirmed after {timeout} seconds")
         return None
+
+    def get_market_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
+        """Finds a market by its slug."""
+        try:
+            markets = self.get_markets()
+            for market in markets:
+                if market.get('slug') == slug:
+                    return market
+            logger.warning(f"Market with slug '{slug}' not found.")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get market by slug: {e}")
+            return None
 
     def _get_web3(self, is_mainnet: bool) -> Web3:
         rpc_token = os.environ.get("RPC_TOKEN")

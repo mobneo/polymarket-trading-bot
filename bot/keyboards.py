@@ -3,7 +3,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 def main_keyboard():
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📊 Markets")],
+            [KeyboardButton(text="📊 Hourly BTC Market")],
             [KeyboardButton(text="💰 Balance")],
             [KeyboardButton(text="📋 My orders")],
             [KeyboardButton(text="🔄 Clear stuck txs")],
@@ -80,5 +80,23 @@ def markets_keyboard(markets):
             ])
     keyboard.inline_keyboard.append([
         InlineKeyboardButton(text="🔙 Back to Menu", callback_data="back_to_main")
+    ])
+    return keyboard
+
+def get_hourly_market_keyboard():
+    """Inline keyboard for the hourly BTC market."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🟢 Buy YES", callback_data="place_hourly_order_buy_yes"),
+            InlineKeyboardButton(text="🔴 Sell YES", callback_data="place_hourly_order_sell_yes"),
+        ],
+        [
+            InlineKeyboardButton(text="🟢 Buy NO", callback_data="place_hourly_order_buy_no"),
+            InlineKeyboardButton(text="🔴 Sell NO", callback_data="place_hourly_order_sell_no"),
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_hourly_market"),
+            InlineKeyboardButton(text="🔙 Main Menu", callback_data="back_to_main"),
+        ]
     ])
     return keyboard
