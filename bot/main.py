@@ -111,8 +111,9 @@ async def show_hourly_btc(message: Message):
             f"⏳ <b>Time Left:</b> {market_info['time_left']}\n"
             f"🕒 <b>Expires At:</b> {market_info['expires_at']}\n\n"
             f"💰 <b>Current Prices:</b>\n"
-            f"   🟢 <b>YES</b> - Bid: {market_info['yes_bid']:.4f} / Ask: {market_info['yes_ask']:.4f}\n"
-            f"   🔴 <b>NO</b>  - Bid: {market_info['no_bid']:.4f} / Ask: {market_info['no_ask']:.4f}\n\n"
+            f"   🟢 <b>YES</b> - Bid: {float(market_info['yes_bid']):.4f} / Ask: {float(market_info['yes_ask']):.4f}\n"
+            f"   🔴 <b>NO</b>  - Bid: {float(market_info['no_bid']):.4f} / Ask: {float(market_info['no_ask']):.4f}\n\n"
+            f"💰 <b>Last Price:</b> {float(market_info['last_trade_price']):.4f}\n\n"
             f"💳 <b>Available Platform Balance:</b> {platform_balance:.2f} pUSD\n\n"
             f"💡 <i>Click buttons below to place orders</i>"
         )
@@ -128,7 +129,6 @@ async def show_balance(message: Message):
         return
     try:
         balance_info = client.get_wallet_balance()
-        print("balance info:", balance_info)
 
         if balance_info:
             usdc_balance = balance_info.get('usdc_balance', 0)

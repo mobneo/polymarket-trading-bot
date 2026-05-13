@@ -8,43 +8,26 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 ET_TIMEZONE = pytz.timezone('US/Eastern')
-BASE_SLUG_TEMPLATE = "bitcoin-up-or-down-{month}-{day}-{hour}{ampm}-et"
 
 
 def get_current_hour_market_slug() -> str:
-    """
-    Generates the slug for the current hourly Bitcoin market based on ET.
-    Example: "bitcoin-up-or-down-may-13-2026-2pm-et"
-    """
+    """Generates the slug for the current hourly Bitcoin market based on ET."""
     now_et = datetime.now(ET_TIMEZONE)
 
-    # --- Изменения начинаются здесь ---
-    # 1. Месяц: полное имя на английском в нижнем регистре
-    month = now_et.strftime("%B").lower()  # 'may'
+    month = now_et.strftime("%B").lower()
+    day = str(now_et.day)
+    year = str(now_et.year)
 
-    # 2. День: число без ведущего нуля
-    day = str(now_et.day)  # '13'
-
-    # 3. Год: четыре цифры
-    year = str(now_et.year)  # '2026'
-
-    # 4. Час: в 12-часовом формате без ведущего нуля
-    hour_12 = now_et.strftime("%-I")  # '2' (может не работать на Windows)
-    # --- Безопасный способ получить час для любой ОС ---
     hour_24 = now_et.hour
     hour_12_display = hour_24 % 12
     if hour_12_display == 0:
         hour_12_display = 12
-    hour = str(hour_12_display)  # '2'
+    hour = str(hour_12_display)
 
-    # 5. AM/PM: в нижнем регистре
-    ampm = now_et.strftime("%p").lower()  # 'pm'
-    # --- Конец изменений ---
+    ampm = now_et.strftime("%p").lower()
 
-    # Собираем slug в правильном порядке: месяц-день-год-час
     slug = f"bitcoin-up-or-down-{month}-{day}-{year}-{hour}{ampm}-et"
-
-    logger.info(f"Generated slug for current hour ({now_et.strftime('%Y-%m-%d %H:%M %Z')}): {slug}")
+    logger.info(f"Generated slug: {slug}")
     return slug
 
 
@@ -74,8 +57,8 @@ class HourlyBitcoinMarket:
         self._clob_token_ids = None
 
     def _get_event_by_slug(self) -> Optional[Dict[str, Any]]:
-        if self._event_data is not None:
-            return self._event_data
+        # if self._event_data is not None:
+        #     return self._event_data
 
         import requests
         url = f"https://gamma-api.polymarket.com/events/slug/{self.slug}"
@@ -85,24 +68,24 @@ class HourlyBitcoinMarket:
             response = requests.get(url, timeout=10)
             response.raise_for_status()
             self._event_data = response.json()
-            logger.info(f"Successfully fetched event data for slug: {self.slug}")
+            logger.info("Successfully fetched event data")
             return self._event_data
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch event data from Gamma API: {e}")
+            logger.error(f"Failed to fetch event data: {e}")
             return None
 
     def find_current_market(self) -> Optional[Dict[str, Any]]:
-        if self._market_data is not None:
-            return self._market_data
+        # if self._market_data is not None:
+        #     return self._market_data
 
         event_data = self._get_event_by_slug()
         if not event_data or not isinstance(event_data, dict):
-            logger.error("Invalid event data received from Gamma API")
+            logger.error("Invalid event data received")
             return None
 
         markets = event_data.get('markets')
         if not markets or not isinstance(markets, list) or len(markets) == 0:
-            logger.error(f"No 'markets' list found in event data")
+            logger.error("No 'markets' list found")
             return None
 
         self._market_data = markets[0]
@@ -121,8 +104,8 @@ class HourlyBitcoinMarket:
         return self._market_data
 
     def get_order_book(self) -> Optional[Dict[str, Any]]:
-        if self._order_book is not None:
-            return self._order_book
+        # if self._order_book is not None:
+        #     return self._order_book
 
         market = self.find_current_market()
         if not market:
@@ -130,12 +113,12 @@ class HourlyBitcoinMarket:
 
         clob_token_ids = self._clob_token_ids
         if not clob_token_ids or len(clob_token_ids) < 1:
-            logger.error("No CLOB token ID found for the Yes outcome")
+            logger.error("No CLOB token ID found")
             return None
 
         yes_token_id = clob_token_ids[0]
-
         logger.info(f"Fetching order book for token ID: {yes_token_id}")
+
         try:
             self._order_book = self.client.get_order_book(yes_token_id)
             return self._order_book
@@ -150,18 +133,25 @@ class HourlyBitcoinMarket:
 
         yes_bid = 0.0
         yes_ask = 0.0
+        min_order_size = 0.0
+        last_trade_price = 0.0
 
         if order_book.get('bids') and len(order_book['bids']) > 0:
-            yes_bid = float(order_book['bids'][0].get('price', 0))
-
+            yes_bid = float(order_book['bids'][-1].get('price', 0))
         if order_book.get('asks') and len(order_book['asks']) > 0:
-            yes_ask = float(order_book['asks'][0].get('price', 0))
+            yes_ask = float(order_book['asks'][-1].get('price', 0))
+        if order_book.get('min_order_size'):
+            min_order_size = float(order_book['min_order_size'])
+        if order_book.get('last_trade_price'):
+            last_trade_price = float(order_book['last_trade_price'])
 
         return {
             'yes_bid': yes_bid,
             'yes_ask': yes_ask,
             'no_bid': 1.0 - yes_ask,
             'no_ask': 1.0 - yes_bid,
+            'min_order_size': min_order_size,
+            'last_trade_price': last_trade_price,
         }
 
     def get_market_info(self) -> Optional[Dict[str, Any]]:
@@ -171,22 +161,30 @@ class HourlyBitcoinMarket:
 
         prices = self.get_prices()
         if not prices:
-            prices = {'yes_bid': 0.0, 'yes_ask': 0.0, 'no_bid': 0.0, 'no_ask': 0.0}
+            prices = {'yes_bid': 0.0, 'yes_ask': 0.0, 'no_bid': 0.0, 'no_ask': 0.0, 'min_order_size': 0.0, 'last_trade_price': 0.0}
 
-        for key in prices:
-            prices[key] = float(prices[key]) if prices[key] is not None else 0.0
+        # Convert all to float explicitly
+        yes_bid = float(prices.get('yes_bid', 0.0))
+        yes_ask = float(prices.get('yes_ask', 0.0))
+        no_bid = float(prices.get('no_bid', 0.0))
+        no_ask = float(prices.get('no_ask', 0.0))
+        min_order_size = float(prices.get('min_order_size', 0.0))
+        last_trade_price = float(prices.get('last_trade_price', 0.0))
 
         time_left = get_time_until_expiry()
+        time_left_str = str(time_left).split('.')[0] if time_left.total_seconds() > 0 else '0:00:00'
 
         return {
             'slug': self.slug,
             'question': market.get('question', 'Unknown'),
             'expires_at': self.expiry_time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-            'time_left': str(time_left).split('.')[0] if time_left.total_seconds() > 0 else '0:00:00',
-            'yes_bid': prices.get('yes_bid', 0.0),
-            'yes_ask': prices.get('yes_ask', 0.0),
-            'no_bid': prices.get('no_bid', 0.0),
-            'no_ask': prices.get('no_ask', 0.0),
+            'time_left': time_left_str,
+            'yes_bid': yes_bid,
+            'yes_ask': yes_ask,
+            'no_bid': no_bid,
+            'no_ask': no_ask,
+            'min_order_size': min_order_size,
+            'last_trade_price': last_trade_price,
         }
 
     def get_clob_token_ids(self) -> Optional[list]:

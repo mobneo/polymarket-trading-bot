@@ -122,7 +122,7 @@ class PolymarketClient:
                         logger.info(f"Transaction confirmed in block {receipt['blockNumber']}")
                         return receipt
                     else:
-                        logger.error(f"Transaction failed with status 0")
+                        logger.error("Transaction failed with status 0")
                         return None
 
                 try:
@@ -130,7 +130,7 @@ class PolymarketClient:
                     if tx:
                         elapsed = int(time.time() - start_time)
                         logger.info(f"Transaction in mempool for {elapsed}s, waiting...")
-                except:
+                except Exception:
                     pass
 
                 time.sleep(poll_latency)
