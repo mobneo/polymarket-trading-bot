@@ -12,7 +12,9 @@ dependencies = [
     "python-dotenv (>=1.2.2,<2.0.0)",
     "py-clob-client-v2 (>=1.0.0,<2.0.0)",
     "web3 (>=7.16.0,<8.0.0)",
-    "pytz (>=2026.2,<2027.0)"
+    "pytz (>=2026.2,<2027.0)",
+    "py-builder-relayer-client (>=0.0.1,<0.0.2)",
+    "py-builder-signing-sdk (>=0.0.2,<0.0.3)"
 ]
 
 [tool.poetry]

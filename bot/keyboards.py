@@ -87,16 +87,29 @@ def get_hourly_market_keyboard():
     """Inline keyboard for the hourly BTC market."""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🟢 Buy YES", callback_data="place_hourly_order_buy_yes"),
-            InlineKeyboardButton(text="🔴 Sell YES", callback_data="place_hourly_order_sell_yes"),
+            InlineKeyboardButton(text="🟢 Buy YES", callback_data="hourly_buy_yes"),
+            InlineKeyboardButton(text="🔴 Sell YES", callback_data="hourly_sell_yes"),
         ],
         [
-            InlineKeyboardButton(text="🟢 Buy NO", callback_data="place_hourly_order_buy_no"),
-            InlineKeyboardButton(text="🔴 Sell NO", callback_data="place_hourly_order_sell_no"),
+            InlineKeyboardButton(text="🟢 Buy NO", callback_data="hourly_buy_no"),
+            InlineKeyboardButton(text="🔴 Sell NO", callback_data="hourly_sell_no"),
         ],
         [
             InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_hourly_market"),
             InlineKeyboardButton(text="🔙 Main Menu", callback_data="back_to_main"),
+        ]
+    ])
+    return keyboard
+
+def order_type_keyboard():
+    """Keyboard for selecting market or limit order"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Market Order", callback_data="order_type_market"),
+            InlineKeyboardButton(text="📈 Limit Order", callback_data="order_type_limit"),
+        ],
+        [
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_order_type"),
         ]
     ])
     return keyboard

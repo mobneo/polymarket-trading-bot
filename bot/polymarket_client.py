@@ -7,6 +7,8 @@ import logging
 from web3 import Web3
 from eth_account import Account
 from py_clob_client_v2.config import get_contract_config
+from py_builder_relayer_client.client import RelayClient
+from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
 from bot.abi.ctf_abi import CTF_ABI
 from bot.abi.usdc_abi import USDC_ABI
 from bot.abi.pusd_abi import PUSD_ABI
@@ -23,9 +25,13 @@ class PolymarketClient:
     def __init__(self, private_key: str, proxy_url: str, chain_id: int = 137, is_mainnet: bool = True):
         self.chain_id = chain_id
         self.is_mainnet = is_mainnet
+        self.private_key = private_key
 
         self.w3 = self._get_web3(is_mainnet)
         self.account = Account.from_key(private_key)
+        self.address = self.account.address
+
+        logger.info(f"EOA Address: {self.address}")
 
         self._check_pol_balance()
 
@@ -40,7 +46,6 @@ class PolymarketClient:
             abi=CTF_ABI,
         )
 
-        # pUSD contract (Polymarket USD)
         pusd_address = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
         self.pusd = self.w3.eth.contract(
             address=Web3.to_checksum_address(pusd_address),
@@ -48,26 +53,91 @@ class PolymarketClient:
         )
         logger.info(f"pUSD contract initialized at: {self.pusd.address}")
 
-        self.client = ClobClient(
+        # Initialize relayer client for deposit wallet
+        self.relayer = self._init_relayer_client()
+
+        # Get deposit wallet address
+        self.deposit_wallet_address = self._get_deposit_wallet_address()
+        logger.info(f"Deposit Wallet Address: {self.deposit_wallet_address}")
+
+        # Initialize temporary CLOB client
+        temp_client = ClobClient(
             host=proxy_url,
             key=private_key,
             chain_id=chain_id,
         )
 
         try:
-            creds = self.client.create_or_derive_api_key()
+            # Create API key
+            creds = temp_client.create_or_derive_api_key()
             logger.info("API credentials generated successfully")
 
+            # Initialize client with POLY_1271 signature type
             self.client = ClobClient(
                 host=proxy_url,
                 key=private_key,
                 chain_id=chain_id,
                 creds=creds,
+                signature_type=3,  # POLY_1271 signature type
+                funder=self.deposit_wallet_address,  # Deposit wallet address
             )
-            logger.info("Polymarket client initialized with full authentication")
+            logger.info(f"Client initialized with signature_type=3, funder={self.deposit_wallet_address}")
+
         except Exception as e:
             logger.error(f"Failed to create API credentials: {e}")
             raise
+
+    def _init_relayer_client(self) -> RelayClient:
+        """Initialize the relayer client for deposit wallet management"""
+        try:
+            builder_config = BuilderConfig(
+                local_builder_creds=BuilderApiKeyCreds(
+                    key=os.environ.get("BUILDER_API_KEY", ""),
+                    secret=os.environ.get("BUILDER_SECRET", ""),
+                    passphrase=os.environ.get("BUILDER_PASS_PHRASE", ""),
+                )
+            )
+
+            relayer_url = os.environ.get("RELAYER_URL", "https://relayer-v2.polymarket.com")
+            relayer = RelayClient(
+                relayer_url,
+                self.chain_id,
+                self.private_key,
+                builder_config,
+            )
+            logger.info("Relayer client initialized successfully")
+            return relayer
+        except Exception as e:
+            logger.error(f"Failed to initialize relayer client: {e}")
+            raise
+
+    def _get_deposit_wallet_address(self) -> str:
+        """Get or deploy deposit wallet address for the current EOA"""
+        try:
+            # Get expected deposit wallet address
+            deposit_wallet = self.relayer.get_expected_deposit_wallet()
+            logger.info(f"Expected deposit wallet address: {deposit_wallet}")
+
+            # Check if deposit wallet is already deployed
+            # You might need to add a method to check deployment status
+
+            # If not deployed, deploy it
+            response = self.relayer.deploy_deposit_wallet()
+            logger.info(f"Deploy deposit wallet response: {response}")
+
+            # Wait for deployment confirmation
+            confirmed = response.wait()
+            if confirmed:
+                logger.info("Deposit wallet deployed successfully")
+            else:
+                logger.warning("Deposit wallet deployment pending")
+
+            return deposit_wallet
+
+        except Exception as e:
+            logger.error(f"Failed to get deposit wallet address: {e}")
+            logger.warning("Falling back to EOA address")
+            return self.address
 
     def _check_pol_balance(self):
         try:
@@ -143,7 +213,6 @@ class PolymarketClient:
         return None
 
     def get_market_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        """Finds a market by its slug."""
         try:
             markets = self.get_markets()
             for market in markets:
@@ -194,11 +263,54 @@ class PolymarketClient:
             logger.error(f"Failed to get order book: {e}")
             return {}
 
-    def place_order(self, token_id: str, price: float, size: float, side: str):
+    # def place_order(self, token_id: str, price: float, size: float, side: str):
+    #     try:
+    #         order = OrderArgs(price=price, size=size, side=side, token_id=token_id)
+    #         signed = self.client.create_order(order)
+    #         return self.client.post_order(signed)
+    #     except Exception as e:
+    #         logger.error(f"Failed to place order: {e}")
+    #         raise
+
+    def place_order(self, token_id: str, price: float, size: float, side: str, order_type: str = "GTC"):
+        """
+        Place an order on Polymarket
+
+        Args:
+            token_id: The token ID to trade
+            price: Price per share (0-1)
+            size: Size in pUSD (will be converted to wei)
+            side: "BUY" or "SELL"
+            order_type: "GTC" (Good 'til Cancelled) or "FOK" (Fill or Kill)
+        """
         try:
-            order = OrderArgs(price=price, size=size, side=side, token_id=token_id)
-            signed = self.client.create_order(order)
-            return self.client.post_order(signed)
+            # Convert size to integer (pUSD has 6 decimals)
+            size_in_wei = int(size * 1_000_000)
+
+            # Convert side to enum
+            from py_clob_client_v2 import Side
+            side_enum = Side.BUY if side.upper() == "BUY" else Side.SELL
+
+            # Create order args
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size_in_wei,
+                side=side_enum,
+            )
+
+            # Set order type (GTC is default)
+            order_type_enum = OrderType.GTC
+            if order_type.upper() == "FOK":
+                order_type_enum = OrderType.FOK
+
+            # Create and post order
+            signed_order = self.client.create_order(order_args)
+            response = self.client.post_order(signed_order, order_type_enum)
+
+            logger.info(f"Order placed successfully: {response}")
+            return response
+
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
             raise
@@ -314,7 +426,6 @@ class PolymarketClient:
             raise
 
     def approve_pusd_for_ctf(self, amount: int = None):
-        """Approve CTF contract to spend pUSD on your behalf"""
         try:
             self.clear_pending_transactions()
 
@@ -322,8 +433,6 @@ class PolymarketClient:
                 amount = MAX_UINT256
 
             logger.info(f"Approving pUSD for CTF contract: amount={amount}")
-            logger.info(f"pUSD contract: {self.pusd.address}")
-            logger.info(f"CTF contract: {self.contract_config.conditional_tokens}")
 
             pol_balance = self.w3.eth.get_balance(self.account.address)
             if pol_balance < 0.02 * 1e18:
@@ -343,7 +452,6 @@ class PolymarketClient:
             nonce = self.w3.eth.get_transaction_count(self.account.address)
             gas_price = self._get_gas_price()
             gas_price = int(gas_price * 1.3)
-            logger.info(f"Using gas price: {gas_price / 1e9:.2f} Gwei")
 
             txn = self.pusd.functions.approve(
                 self.contract_config.conditional_tokens,
@@ -372,7 +480,6 @@ class PolymarketClient:
             raise
 
     def approve_pusd_for_exchange(self, amount: int = None):
-        """Approve Exchange contract to spend pUSD on your behalf"""
         try:
             self.clear_pending_transactions()
 
@@ -380,8 +487,6 @@ class PolymarketClient:
                 amount = MAX_UINT256
 
             logger.info(f"Approving pUSD for Exchange contract: amount={amount}")
-            logger.info(f"pUSD contract: {self.pusd.address}")
-            logger.info(f"Exchange contract: {self.contract_config.exchange}")
 
             pol_balance = self.w3.eth.get_balance(self.account.address)
             if pol_balance < 0.02 * 1e18:
@@ -429,7 +534,6 @@ class PolymarketClient:
             raise
 
     def approve_pusd_all(self, amount: int = None):
-        """Approve both CTF and Exchange contracts to spend pUSD"""
         try:
             logger.info("Setting up all pUSD approvals...")
 
@@ -560,7 +664,6 @@ class PolymarketClient:
             allowances = api_result.get('allowances', {})
             platform_balance = int(api_result.get('balance', '0')) if api_result else 0
 
-            # Get pUSD allowances
             pusd_ctf_allowance = self.pusd.functions.allowance(
                 self.account.address,
                 self.contract_config.conditional_tokens

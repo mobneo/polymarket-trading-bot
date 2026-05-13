@@ -9,7 +9,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
 
 from bot.config import config
-from bot.keyboards import main_keyboard, market_actions_keyboard, markets_keyboard, balance_keyboard, approve_confirmation_keyboard, get_hourly_market_keyboard
+from bot.keyboards import (main_keyboard, market_actions_keyboard, markets_keyboard,
+                          balance_keyboard, approve_confirmation_keyboard,
+                          get_hourly_market_keyboard, order_type_keyboard)
 from bot.polymarket_client import PolymarketClient
 from bot.hourly_market import HourlyBitcoinMarket, get_time_until_expiry
 
@@ -32,6 +34,7 @@ class OrderForm(StatesGroup):
 
 
 class HourlyOrderForm(StatesGroup):
+    waiting_order_type = State()
     waiting_price = State()
     waiting_size = State()
 
@@ -286,35 +289,42 @@ async def refresh_hourly_market(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("hourly_buy_"))
 async def start_hourly_buy(callback: CallbackQuery, state: FSMContext):
-    """Start buy order for hourly market"""
+    """Start buy order for hourly market (YES or NO)"""
     outcome = callback.data.split("_")[2]  # 'yes' or 'no'
     await state.update_data(
         outcome=outcome,
         side="BUY",
         market_slug=current_hourly_market.slug
     )
-    await state.set_state(HourlyOrderForm.waiting_price)
-    await callback.message.answer(f"🟢 BUY {outcome.upper()}\nEnter price (0-1):")
+    await state.set_state(HourlyOrderForm.waiting_order_type)
+    await callback.message.answer(
+        f"🟢 BUY {outcome.upper()}\n\n"
+        f"Select order type:",
+        reply_markup=order_type_keyboard()
+    )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("hourly_sell_"))
 async def start_hourly_sell(callback: CallbackQuery, state: FSMContext):
-    """Start sell order for hourly market"""
+    """Start sell order for hourly market (YES or NO)"""
     outcome = callback.data.split("_")[2]  # 'yes' or 'no'
     await state.update_data(
         outcome=outcome,
         side="SELL",
         market_slug=current_hourly_market.slug
     )
-    await state.set_state(HourlyOrderForm.waiting_price)
-    await callback.message.answer(f"🔴 SELL {outcome.upper()}\nEnter price (0-1):")
+    await state.set_state(HourlyOrderForm.waiting_order_type)
+    await callback.message.answer(
+        f"🔴 SELL {outcome.upper()}\n\n"
+        f"Select order type:",
+        reply_markup=order_type_keyboard()
+    )
     await callback.answer()
-
 
 @dp.message(HourlyOrderForm.waiting_price)
 async def process_hourly_price(message: Message, state: FSMContext):
-    """Process price input for hourly market order"""
+    """Process price input for limit order"""
     try:
         price = float(message.text)
         if not 0 <= price <= 1:
@@ -325,12 +335,114 @@ async def process_hourly_price(message: Message, state: FSMContext):
 
     await state.update_data(price=price)
     await state.set_state(HourlyOrderForm.waiting_size)
-    await message.answer(f"Price: {price}\nEnter quantity in pUSD (e.g., 10):")
+    await message.answer(f"💰 Price: {price:.4f}\n📦 Enter quantity in pUSD (e.g., 10):")
+
+# @dp.message(HourlyOrderForm.waiting_size)
+# async def process_hourly_size(message: Message, state: FSMContext):
+#     """Process size input and place order (market or limit)"""
+#     try:
+#         size = float(message.text)
+#         if size <= 0:
+#             raise ValueError
+#     except ValueError:
+#         await message.answer("❌ Invalid quantity. Please enter a positive number:")
+#         return
+
+#     data = await state.get_data()
+#     await state.clear()
+
+#     # Get current market
+#     hourly_market = HourlyBitcoinMarket(client)
+
+#     # Get CLOB token IDs
+#     clob_token_ids = hourly_market.get_clob_token_ids()
+#     if not clob_token_ids or len(clob_token_ids) < 2:
+#         await message.answer("❌ Could not get token IDs for the market.")
+#         return
+
+#     # Select token based on outcome
+#     if data['outcome'] == 'yes':
+#         token_id = clob_token_ids[0]
+#         outcome_name = "YES"
+#     else:
+#         token_id = clob_token_ids[1]
+#         outcome_name = "NO"
+
+#     if not token_id:
+#         await message.answer("❌ Could not find token ID for the selected outcome.")
+#         return
+
+#     # Convert size to integer (pUSD has 6 decimals)
+#     size_in_wei = int(size * 1_000_000)
+
+#     # Determine price based on order type
+#     order_price = None
+#     order_type_text = ""
+
+#     if data.get('order_type') == "market":
+#         # Market order - use best available price
+#         prices = hourly_market.get_prices()
+#         if prices:
+#             if data['side'] == "BUY":
+#                 order_price = prices['yes_ask'] if data['outcome'] == 'yes' else prices['no_ask']
+#             else:
+#                 order_price = prices['yes_bid'] if data['outcome'] == 'yes' else prices['no_bid']
+#         order_type_text = "Market Order"
+#     else:
+#         # Limit order - use user's price
+#         order_price = data.get('price')
+#         order_type_text = "Limit Order"
+
+#     if not order_price:
+#         await message.answer("❌ Could not determine order price. Please try again.")
+#         return
+
+#     try:
+#         result = client.place_order(
+#             token_id=token_id,
+#             price=order_price,
+#             size=size_in_wei,
+#             side=data['side'],
+#         )
+
+#         # Calculate cost/return
+#         if data['side'] == "BUY":
+#             cost = size * order_price
+#             text = (
+#                 f"✅ <b>Order placed successfully!</b>\n\n"
+#                 f"📊 Market: BTC Hourly\n"
+#                 f"📋 Type: {order_type_text}\n"
+#                 f"🎯 Outcome: {outcome_name}\n"
+#                 f"📈 Side: BUY\n"
+#                 f"💰 Price: {order_price:.4f}\n"
+#                 f"📦 Size: {size:.2f} pUSD\n"
+#                 f"💸 Total Cost: {cost:.2f} pUSD\n\n"
+#                 f"🆔 Order ID: <code>{result.get('id', 'N/A')[:16]}...</code>"
+#             )
+#         else:
+#             return_val = size * order_price
+#             text = (
+#                 f"✅ <b>Order placed successfully!</b>\n\n"
+#                 f"📊 Market: BTC Hourly\n"
+#                 f"📋 Type: {order_type_text}\n"
+#                 f"🎯 Outcome: {outcome_name}\n"
+#                 f"📉 Side: SELL\n"
+#                 f"💰 Price: {order_price:.4f}\n"
+#                 f"📦 Size: {size:.2f} pUSD\n"
+#                 f"💰 Return if filled: {return_val:.2f} pUSD\n\n"
+#                 f"🆔 Order ID: <code>{result.get('id', 'N/A')[:16]}...</code>"
+#             )
+
+#         await message.answer(text, parse_mode="HTML", reply_markup=main_keyboard())
+
+#     except Exception as e:
+#         logger.error(f"Error placing order: {e}")
+#         await message.answer(f"❌ Order failed: {str(e)}", reply_markup=main_keyboard())
 
 
 @dp.message(HourlyOrderForm.waiting_size)
 async def process_hourly_size(message: Message, state: FSMContext):
-    """Process size input and place hourly market order"""
+    """Process size input and place order (market or limit)"""
     try:
         size = float(message.text)
         if size <= 0:
@@ -342,67 +454,92 @@ async def process_hourly_size(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
 
-    # Get current market (in case it changed)
+    # Get current market
     hourly_market = HourlyBitcoinMarket(client)
 
-    # Get CLOB token IDs from the market
+    # Get CLOB token IDs
     clob_token_ids = hourly_market.get_clob_token_ids()
     if not clob_token_ids or len(clob_token_ids) < 2:
         await message.answer("❌ Could not get token IDs for the market.")
         return
 
-    # Select token: first for "Yes", second for "No"
-    token_id = None
+    # Select token based on outcome
     if data['outcome'] == 'yes':
         token_id = clob_token_ids[0]
-    else:  # outcome == 'no'
+        outcome_name = "YES"
+    else:
         token_id = clob_token_ids[1]
+        outcome_name = "NO"
 
     if not token_id:
         await message.answer("❌ Could not find token ID for the selected outcome.")
         return
 
-    # Convert size to integer (pUSD has 6 decimals)
-    size_in_wei = int(size * 1e6)
+    # Determine price based on order type
+    order_price = None
+    order_type_text = ""
+
+    if data.get('order_type') == "market":
+        # Market order - use best available price
+        prices = hourly_market.get_prices()
+        if prices:
+            if data['side'] == "BUY":
+                order_price = prices['yes_ask'] if data['outcome'] == 'yes' else prices['no_ask']
+            else:
+                order_price = prices['yes_bid'] if data['outcome'] == 'yes' else prices['no_bid']
+        order_type_text = "Market Order"
+    else:
+        # Limit order - use user's price
+        order_price = data.get('price')
+        order_type_text = "Limit Order"
+
+    if not order_price:
+        await message.answer("❌ Could not determine order price. Please try again.")
+        return
 
     try:
+        # Place order using the updated method
+        # Use "GTC" for limit orders, "FOK" for market orders (or keep both as GTC)
         result = client.place_order(
             token_id=token_id,
-            price=data['price'],
-            size=size_in_wei,
+            price=order_price,
+            size=size,  # Pass size as float, conversion happens inside
             side=data['side'],
+            order_type="GTC",  # You can change to "FOK" if needed
         )
 
         # Calculate cost/return
         if data['side'] == "BUY":
-            cost = size * data['price']
+            cost = size * order_price
             text = (
                 f"✅ <b>Order placed successfully!</b>\n\n"
                 f"📊 Market: BTC Hourly\n"
-                f"🎯 Outcome: {data['outcome'].upper()}\n"
-                f"📈 Side: {data['side']}\n"
-                f"💰 Price: {data['price']:.4f}\n"
+                f"📋 Type: {order_type_text}\n"
+                f"🎯 Outcome: {outcome_name}\n"
+                f"📈 Side: BUY\n"
+                f"💰 Price: {order_price:.4f}\n"
                 f"📦 Size: {size:.2f} pUSD\n"
                 f"💸 Total Cost: {cost:.2f} pUSD\n\n"
-                f"🆔 Order ID: <code>{result.get('id', 'N/A')[:20]}...</code>"
+                f"🆔 Order ID: <code>{result.get('id', 'N/A')[:16]}...</code>"
             )
         else:
-            return_val = size * data['price']
+            return_val = size * order_price
             text = (
                 f"✅ <b>Order placed successfully!</b>\n\n"
                 f"📊 Market: BTC Hourly\n"
-                f"🎯 Outcome: {data['outcome'].upper()}\n"
-                f"📉 Side: {data['side']}\n"
-                f"💰 Price: {data['price']:.4f}\n"
+                f"📋 Type: {order_type_text}\n"
+                f"🎯 Outcome: {outcome_name}\n"
+                f"📉 Side: SELL\n"
+                f"💰 Price: {order_price:.4f}\n"
                 f"📦 Size: {size:.2f} pUSD\n"
                 f"💰 Return if filled: {return_val:.2f} pUSD\n\n"
-                f"🆔 Order ID: <code>{result.get('id', 'N/A')[:20]}...</code>"
+                f"🆔 Order ID: <code>{result.get('id', 'N/A')[:16]}...</code>"
             )
 
         await message.answer(text, parse_mode="HTML", reply_markup=main_keyboard())
 
     except Exception as e:
-        logger.error(f"Error placing hourly order: {e}")
+        logger.error(f"Error placing order: {e}")
         await message.answer(f"❌ Order failed: {str(e)}", reply_markup=main_keyboard())
 
 @dp.callback_query(F.data == "approve_usdc")
@@ -712,6 +849,68 @@ async def start_sell(callback: CallbackQuery, state: FSMContext):
     await state.update_data(token_id=token_id, side="SELL")
     await state.set_state(OrderForm.waiting_price)
     await callback.message.answer("🔴 SELL\nEnter price (0-1):")
+
+@dp.callback_query(F.data == "order_type_market")
+async def process_market_order(callback: CallbackQuery, state: FSMContext):
+    """Process market order selection - use best available price"""
+    await state.update_data(order_type="market")
+    await state.set_state(HourlyOrderForm.waiting_size)
+
+    # Get current market prices
+    hourly_market = HourlyBitcoinMarket(client)
+    prices = hourly_market.get_prices()
+    data = await state.get_data()
+
+    if prices:
+        if data['side'] == "BUY":
+            best_price = prices['yes_ask'] if data['outcome'] == 'yes' else prices['no_ask']
+            await callback.message.answer(
+                f"📊 Market Order - {data['side']} {data['outcome'].upper()}\n\n"
+                f"💰 Best available price: {best_price:.4f}\n"
+                f"📦 Enter quantity in pUSD (e.g., 10):\n\n"
+                f"⚠️ Order will execute immediately at current market price"
+            )
+        else:
+            best_price = prices['yes_bid'] if data['outcome'] == 'yes' else prices['no_bid']
+            await callback.message.answer(
+                f"📊 Market Order - {data['side']} {data['outcome'].upper()}\n\n"
+                f"💰 Best available price: {best_price:.4f}\n"
+                f"📦 Enter quantity in pUSD (e.g., 10):\n\n"
+                f"⚠️ Order will execute immediately at current market price"
+            )
+    else:
+        await callback.message.answer(
+            f"📊 Market Order - {data['side']} {data['outcome'].upper()}\n\n"
+            f"📦 Enter quantity in pUSD (e.g., 10):"
+        )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "order_type_limit")
+async def process_limit_order(callback: CallbackQuery, state: FSMContext):
+    """Process limit order selection - user sets price"""
+    await state.update_data(order_type="limit")
+    await state.set_state(HourlyOrderForm.waiting_price)
+
+    data = await state.get_data()
+    await callback.message.answer(
+        f"📈 Limit Order - {data['side']} {data['outcome'].upper()}\n\n"
+        f"💰 Enter price (0-1):\n\n"
+        f"💡 Tip: Check current prices using the Refresh button"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancel_order_type")
+async def cancel_order_type(callback: CallbackQuery, state: FSMContext):
+    """Cancel order type selection"""
+    await state.clear()
+    await callback.message.answer(
+        "❌ Order cancelled. Select an action:",
+        reply_markup=main_keyboard()
+    )
+    await callback.answer()
 
 
 @dp.message(OrderForm.waiting_price)
