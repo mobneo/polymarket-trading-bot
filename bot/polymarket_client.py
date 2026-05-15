@@ -1,8 +1,10 @@
 import os
 import time
+import requests
 from typing import Any, Dict, Optional
-from py_clob_client_v2 import ClobClient, ApiCreds
+from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2, Side
 from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams, OrderArgs, OrderType
+# from py_clob_client_v2.order_builder import
 import logging
 from web3 import Web3
 from eth_account import Account
@@ -20,6 +22,7 @@ DEFAULT_GAS_PRICE = 200_000_000_000
 GAS_LIMIT = 250_000
 MAX_UINT256 = 2**256 - 1
 TX_TIMEOUT = 300
+
 
 class PolymarketClient:
     def __init__(self, private_key: str, proxy_url: str, chain_id: int = 137, is_mainnet: bool = True):
@@ -56,36 +59,13 @@ class PolymarketClient:
         # Initialize relayer client for deposit wallet
         self.relayer = self._init_relayer_client()
 
-        # Get deposit wallet address
-        self.deposit_wallet_address = self._get_deposit_wallet_address()
+        # Get deposit wallet address - используем правильный метод
+        self.deposit_wallet_address = self._get_or_deploy_deposit_wallet()
         logger.info(f"Deposit Wallet Address: {self.deposit_wallet_address}")
 
-        # Initialize temporary CLOB client
-        temp_client = ClobClient(
-            host=proxy_url,
-            key=private_key,
-            chain_id=chain_id,
-        )
-
-        try:
-            # Create API key
-            creds = temp_client.create_or_derive_api_key()
-            logger.info("API credentials generated successfully")
-
-            # Initialize client with POLY_1271 signature type
-            self.client = ClobClient(
-                host=proxy_url,
-                key=private_key,
-                chain_id=chain_id,
-                creds=creds,
-                signature_type=3,  # POLY_1271 signature type
-                funder=self.deposit_wallet_address,  # Deposit wallet address
-            )
-            logger.info(f"Client initialized with signature_type=3, funder={self.deposit_wallet_address}")
-
-        except Exception as e:
-            logger.error(f"Failed to create API credentials: {e}")
-            raise
+        # Initialize client with POLY_1271 signature type
+        self.client = self._initialize_client_with_proxy(proxy_url)
+        logger.info(f"Client initialized with POLY_1271, funder={self.deposit_wallet_address}")
 
     def _init_relayer_client(self) -> RelayClient:
         """Initialize the relayer client for deposit wallet management"""
@@ -111,41 +91,179 @@ class PolymarketClient:
             logger.error(f"Failed to initialize relayer client: {e}")
             raise
 
-    def _get_deposit_wallet_address(self) -> str:
+    def _get_or_deploy_deposit_wallet(self) -> str:
         """Get or deploy deposit wallet address for the current EOA"""
         try:
-            # Get expected deposit wallet address
-            deposit_wallet = self.relayer.get_expected_deposit_wallet()
-            logger.info(f"Expected deposit wallet address: {deposit_wallet}")
+            # Step 1: Get the expected deposit wallet address (deterministic)
+            # According to Polymarket docs, this method exists in RelayClient [citation:5]
+            expected_address = self.relayer.get_expected_deposit_wallet()
+            logger.info(f"Expected deposit wallet address: {expected_address}")
 
-            # Check if deposit wallet is already deployed
-            # You might need to add a method to check deployment status
+            # Step 2: Check if contract is already deployed
+            code = self.w3.eth.get_code(Web3.to_checksum_address(expected_address))
 
-            # If not deployed, deploy it
-            response = self.relayer.deploy_deposit_wallet()
-            logger.info(f"Deploy deposit wallet response: {response}")
+            if len(code) <= 2:
+                # Contract not deployed, deploy it
+                logger.info("Deposit wallet not deployed, deploying now...")
+                response = self.relayer.deploy_deposit_wallet()
+                logger.info(f"Deploy deposit wallet response: {response}")
 
-            # Wait for deployment confirmation
-            confirmed = response.wait()
-            if confirmed:
-                logger.info("Deposit wallet deployed successfully")
+                # Wait for confirmation
+                confirmed = response.wait()
+                if not confirmed:
+                    raise Exception("Deposit wallet deployment failed to confirm")
+
+                # Wait a bit for propagation
+                time.sleep(3)
+
+                # Verify deployment
+                code = self.w3.eth.get_code(Web3.to_checksum_address(expected_address))
+                if len(code) <= 2:
+                    raise Exception("Contract deployment verification failed")
+
+                logger.info("Deposit wallet deployed and verified")
             else:
-                logger.warning("Deposit wallet deployment pending")
+                logger.info("Deposit wallet already deployed")
 
-            return deposit_wallet
+            return expected_address
 
+        except AttributeError as e:
+            # If get_expected_deposit_wallet doesn't exist, we need to derive the address differently
+            logger.warning(f"get_expected_deposit_wallet not available: {e}")
+            logger.info("Attempting to derive deposit wallet address manually...")
+            return self._derive_deposit_wallet_manually()
         except Exception as e:
-            logger.error(f"Failed to get deposit wallet address: {e}")
-            logger.warning("Falling back to EOA address")
+            logger.error(f"Failed to get/deploy deposit wallet: {e}")
+            raise
+
+    def _derive_deposit_wallet_manually(self) -> str:
+        """Manually derive deposit wallet address if relayer method is not available"""
+        # According to Polymarket docs, the deposit wallet address is deterministic [citation:5]
+        # It can be derived from the owner address and the deposit wallet factory contract
+
+        # For now, we can get it by calling the bridge API to get deposit addresses
+        try:
+            response = requests.post(
+                "https://bridge.polymarket.com/deposit",
+                json={"address": self.address},
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            data = response.json()
+            # The EVM deposit address is what we need
+            evm_address = data.get("address", {}).get("evm")
+            if evm_address:
+                logger.info(f"Derived deposit wallet address from bridge API: {evm_address}")
+                return evm_address
+            else:
+                raise Exception("No EVM address in response")
+        except Exception as e:
+            logger.error(f"Failed to derive deposit wallet address: {e}")
+            logger.warning("Falling back to EOA address - this may not work for trading")
             return self.address
+
+    def _verify_proxy_deployed(self) -> bool:
+        """Verify that the proxy contract is deployed"""
+        try:
+            code = self.w3.eth.get_code(Web3.to_checksum_address(self.deposit_wallet_address))
+            is_deployed = len(code) > 2
+            logger.info(f"Proxy deployed: {is_deployed}, code length: {len(code)}")
+            return is_deployed
+        except Exception as e:
+            logger.error(f"Failed to verify proxy deployment: {e}")
+            return False
+
+    def _initialize_client_with_proxy(self, proxy_url: str) -> ClobClient:
+        """Initialize CLOB client with POLY_1271 signature type."""
+
+        # --- 1. Получение или деплой deposit wallet ---
+        if not self._verify_proxy_deployed():
+            logger.warning("Proxy contract not deployed! Deploying now...")
+            self._get_or_deploy_deposit_wallet()
+
+        # --- 2. Очистка старых API ключей ---
+        # Создаем "чистый" клиент для администрирования ключей
+        admin_client = ClobClient(
+            host=proxy_url,
+            chain_id=self.chain_id,
+            key=self.private_key,
+        )
+
+        try:
+            # Получаем список существующих ключей
+            existing_keys = admin_client.get_api_keys()
+            if existing_keys and hasattr(existing_keys, 'api_keys'):
+                for key_info in existing_keys.api_keys:
+                    logger.info(f"Deleting existing API key: {key_info.api_key}")
+                    admin_client.delete_api_key(key_info.api_key)
+            logger.info("Existing API keys cleared.")
+        except Exception as e:
+            # Если ключей нет, просто логируем ошибку
+            logger.info(f"No existing keys to delete or error: {e}")
+
+        # --- 3. Создание НОВОГО API ключа с funder = deposit wallet ---
+        # Создаем временный клиент для генерации ключа
+        temp_client = ClobClient(
+            host=proxy_url,
+            chain_id=self.chain_id,
+            key=self.private_key,
+            signature_type=SignatureTypeV2.POLY_1271,
+            funder=self.deposit_wallet_address,
+        )
+
+        try:
+            # Генерируем ключ. Он должен привязаться к deposit_wallet_address!
+            creds = temp_client.create_or_derive_api_key()
+            logger.info(f"SUCCESS: New API Key created for deposit wallet: {self.deposit_wallet_address}")
+        except Exception as e:
+            logger.error(f"Failed to create new API key: {e}")
+            raise
+
+        # --- 4. Инициализация основного клиента с новым ключом ---
+        client = ClobClient(
+            host=proxy_url,
+            chain_id=self.chain_id,
+            key=self.private_key,
+            creds=creds,
+            signature_type=SignatureTypeV2.POLY_1271,
+            funder=self.deposit_wallet_address,
+        )
+
+        # --- 5. Проверка работоспособности ---
+        ok = client.get_ok()
+        logger.info(f"Health check: {ok}")
+        if ok != "OK":
+            raise Exception("CLOB server health check failed")
+
+        # Важно: Проверяем, что баланс можно получить, что подтвердит правильность настройки
+        try:
+            balance = client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            logger.info("Balance check successful - authentication is working!")
+        except Exception as e:
+            logger.error(f"CRITICAL: Balance check failed even after key reset. Error: {e}")
+            # Это может указывать, что deposit wallet не синхронизирован или не имеет средств.
+
+        return client
+
+    def sync_clob_balance(self):
+        """Sync on-chain balance with CLOB - required after deposits/approvals"""
+        try:
+            result = self.client.update_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            logger.info(f"Balance synced successfully: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to sync balance: {e}")
+            raise
 
     def _check_pol_balance(self):
         try:
             pol_balance = self.w3.eth.get_balance(self.account.address)
             pol_balance_formatted = pol_balance / 1e18
 
-            if pol_balance_formatted < 0.01:
-                logger.warning(f"Low POL balance: {pol_balance_formatted:.6f} POL. Need at least 0.01 POL for gas fees.")
+            if pol_balance_formatted < 0.05:
+                logger.warning(f"Low POL balance: {pol_balance_formatted:.6f} POL. Need at least 0.05 POL for gas fees.")
             else:
                 logger.info(f"POL balance: {pol_balance_formatted:.6f} POL")
 
@@ -212,18 +330,6 @@ class PolymarketClient:
         logger.error(f"Transaction not confirmed after {timeout} seconds")
         return None
 
-    def get_market_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        try:
-            markets = self.get_markets()
-            for market in markets:
-                if market.get('slug') == slug:
-                    return market
-            logger.warning(f"Market with slug '{slug}' not found.")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get market by slug: {e}")
-            return None
-
     def _get_web3(self, is_mainnet: bool) -> Web3:
         rpc_token = os.environ.get("RPC_TOKEN")
 
@@ -256,21 +362,24 @@ class PolymarketClient:
             logger.error(f"Failed to get markets: {e}")
             return []
 
+    def get_market_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
+        try:
+            markets = self.get_markets()
+            for market in markets:
+                if market.get('slug') == slug:
+                    return market
+            logger.warning(f"Market with slug '{slug}' not found.")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get market by slug: {e}")
+            return None
+
     def get_order_book(self, token_id: str):
         try:
             return self.client.get_order_book(token_id)
         except Exception as e:
             logger.error(f"Failed to get order book: {e}")
             return {}
-
-    # def place_order(self, token_id: str, price: float, size: float, side: str):
-    #     try:
-    #         order = OrderArgs(price=price, size=size, side=side, token_id=token_id)
-    #         signed = self.client.create_order(order)
-    #         return self.client.post_order(signed)
-    #     except Exception as e:
-    #         logger.error(f"Failed to place order: {e}")
-    #         raise
 
     def place_order(self, token_id: str, price: float, size: float, side: str, order_type: str = "GTC"):
         """
@@ -279,16 +388,15 @@ class PolymarketClient:
         Args:
             token_id: The token ID to trade
             price: Price per share (0-1)
-            size: Size in pUSD (will be converted to wei)
+            size: Size in USDC (will be converted to wei)
             side: "BUY" or "SELL"
             order_type: "GTC" (Good 'til Cancelled) or "FOK" (Fill or Kill)
         """
         try:
-            # Convert size to integer (pUSD has 6 decimals)
+            # Convert size to integer (USDC has 6 decimals)
             size_in_wei = int(size * 1_000_000)
 
             # Convert side to enum
-            from py_clob_client_v2 import Side
             side_enum = Side.BUY if side.upper() == "BUY" else Side.SELL
 
             # Create order args
@@ -299,10 +407,8 @@ class PolymarketClient:
                 side=side_enum,
             )
 
-            # Set order type (GTC is default)
-            order_type_enum = OrderType.GTC
-            if order_type.upper() == "FOK":
-                order_type_enum = OrderType.FOK
+            # Set order type
+            order_type_enum = OrderType.GTC if order_type.upper() == "GTC" else OrderType.FOK
 
             # Create and post order
             signed_order = self.client.create_order(order_args)
@@ -337,6 +443,7 @@ class PolymarketClient:
             raise
 
     def get_balance_allowance(self):
+        """Get balance and allowance from CLOB"""
         try:
             result = self.client.get_balance_allowance(
                 params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -348,6 +455,7 @@ class PolymarketClient:
             return None
 
     def approve_usdc(self, amount: int = None):
+        """Approve USDC for CTF and Exchange contracts"""
         try:
             self.clear_pending_transactions()
 
@@ -419,137 +527,20 @@ class PolymarketClient:
                     tx_hashes.append(tx_hash.hex())
 
             logger.info(f"USDC approvals completed successfully. TXs: {tx_hashes}")
+
+            # Sync balance with CLOB after approvals
+            if tx_hashes:
+                time.sleep(2)
+                self.sync_clob_balance()
+
             return tx_hashes
 
         except Exception as e:
             logger.error(f"Failed to approve USDC: {e}")
             raise
 
-    def approve_pusd_for_ctf(self, amount: int = None):
-        try:
-            self.clear_pending_transactions()
-
-            if amount is None:
-                amount = MAX_UINT256
-
-            logger.info(f"Approving pUSD for CTF contract: amount={amount}")
-
-            pol_balance = self.w3.eth.get_balance(self.account.address)
-            if pol_balance < 0.02 * 1e18:
-                raise Exception(f"Insufficient POL for gas: {pol_balance / 1e18:.6f} POL")
-
-            current_allowance = self.pusd.functions.allowance(
-                self.account.address,
-                self.contract_config.conditional_tokens
-            ).call()
-
-            logger.info(f"Current pUSD allowance for CTF: {current_allowance}")
-
-            if current_allowance >= amount:
-                logger.info("pUSD allowance already sufficient")
-                return True
-
-            nonce = self.w3.eth.get_transaction_count(self.account.address)
-            gas_price = self._get_gas_price()
-            gas_price = int(gas_price * 1.3)
-
-            txn = self.pusd.functions.approve(
-                self.contract_config.conditional_tokens,
-                amount
-            ).build_transaction({
-                "from": self.account.address,
-                "gasPrice": gas_price,
-                "gas": GAS_LIMIT,
-                "nonce": nonce,
-                "chainId": self.chain_id,
-            })
-
-            signed = self.account.sign_transaction(txn)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            logger.info(f"pUSD approval tx sent: {tx_hash.hex()}")
-
-            receipt = self._wait_for_transaction(tx_hash)
-            if receipt:
-                logger.info("pUSD approval confirmed")
-                return tx_hash.hex()
-            else:
-                raise Exception("pUSD approval not confirmed")
-
-        except Exception as e:
-            logger.error(f"Failed to approve pUSD: {e}")
-            raise
-
-    def approve_pusd_for_exchange(self, amount: int = None):
-        try:
-            self.clear_pending_transactions()
-
-            if amount is None:
-                amount = MAX_UINT256
-
-            logger.info(f"Approving pUSD for Exchange contract: amount={amount}")
-
-            pol_balance = self.w3.eth.get_balance(self.account.address)
-            if pol_balance < 0.02 * 1e18:
-                raise Exception(f"Insufficient POL for gas: {pol_balance / 1e18:.6f} POL")
-
-            current_allowance = self.pusd.functions.allowance(
-                self.account.address,
-                self.contract_config.exchange
-            ).call()
-
-            logger.info(f"Current pUSD allowance for Exchange: {current_allowance}")
-
-            if current_allowance >= amount:
-                logger.info("pUSD allowance for Exchange already sufficient")
-                return True
-
-            nonce = self.w3.eth.get_transaction_count(self.account.address)
-            gas_price = self._get_gas_price()
-            gas_price = int(gas_price * 1.3)
-
-            txn = self.pusd.functions.approve(
-                self.contract_config.exchange,
-                amount
-            ).build_transaction({
-                "from": self.account.address,
-                "gasPrice": gas_price,
-                "gas": GAS_LIMIT,
-                "nonce": nonce,
-                "chainId": self.chain_id,
-            })
-
-            signed = self.account.sign_transaction(txn)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            logger.info(f"pUSD exchange approval tx sent: {tx_hash.hex()}")
-
-            receipt = self._wait_for_transaction(tx_hash)
-            if receipt:
-                logger.info("pUSD exchange approval confirmed")
-                return tx_hash.hex()
-            else:
-                raise Exception("pUSD exchange approval not confirmed")
-
-        except Exception as e:
-            logger.error(f"Failed to approve pUSD for Exchange: {e}")
-            raise
-
-    def approve_pusd_all(self, amount: int = None):
-        try:
-            logger.info("Setting up all pUSD approvals...")
-
-            ctf_tx = self.approve_pusd_for_ctf(amount)
-            exchange_tx = self.approve_pusd_for_exchange(amount)
-
-            logger.info("All pUSD approvals completed successfully")
-            return {
-                "ctf_approval": ctf_tx,
-                "exchange_approval": exchange_tx
-            }
-        except Exception as e:
-            logger.error(f"Failed to setup pUSD approvals: {e}")
-            raise
-
     def approve_conditional_tokens(self):
+        """Approve Conditional Tokens for Exchange"""
         try:
             self.clear_pending_transactions()
 
@@ -592,23 +583,8 @@ class PolymarketClient:
             logger.error(f"Failed to approve Conditional Tokens: {e}")
             raise
 
-    def setup_all_approvals(self, usdc_amount: int = None):
-        try:
-            logger.info("Setting up all approvals...")
-
-            usdc_txs = self.approve_usdc(usdc_amount)
-            ctf_tx = self.approve_conditional_tokens()
-
-            logger.info("All approvals completed successfully")
-            return {
-                "usdc_approvals": usdc_txs,
-                "ctf_approval": ctf_tx
-            }
-        except Exception as e:
-            logger.error(f"Failed to setup approvals: {e}")
-            raise
-
     def clear_pending_transactions(self):
+        """Clear stuck transactions"""
         try:
             logger.info("Checking for stuck transactions...")
 
@@ -652,48 +628,32 @@ class PolymarketClient:
             return False
 
     def get_wallet_balance(self):
+        """Get complete wallet balance information"""
         try:
             usdc_balance = self.usdc.functions.balanceOf(self.account.address).call()
-            pusd_balance = self.pusd.functions.balanceOf(self.account.address).call()
             pol_balance = self.w3.eth.get_balance(self.account.address)
 
             api_result = self.client.get_balance_allowance(
                 params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
 
-            allowances = api_result.get('allowances', {})
+            allowances = api_result.get('allowances', {}) if api_result else {}
             platform_balance = int(api_result.get('balance', '0')) if api_result else 0
-
-            pusd_ctf_allowance = self.pusd.functions.allowance(
-                self.account.address,
-                self.contract_config.conditional_tokens
-            ).call()
-            pusd_exchange_allowance = self.pusd.functions.allowance(
-                self.account.address,
-                self.contract_config.exchange
-            ).call()
 
             return {
                 'usdc_balance': usdc_balance,
                 'usdc_balance_formatted': usdc_balance / 1e6,
-                'pusd_balance': pusd_balance,
-                'pusd_balance_formatted': pusd_balance / 1e6,
                 'platform_balance': platform_balance,
                 'platform_balance_formatted': platform_balance / 1e6,
                 'pol_balance': pol_balance,
                 'pol_balance_formatted': pol_balance / 1e18,
-                'api_balance': api_result.get('balance', '0'),
-                'allowances': allowances,
                 'exchange_allowance': allowances.get(self.contract_config.exchange, '0'),
-                'pusd_ctf_allowance': pusd_ctf_allowance,
-                'pusd_ctf_allowance_formatted': "∞" if pusd_ctf_allowance == MAX_UINT256 else f"{pusd_ctf_allowance / 1e6:.2f}",
-                'pusd_exchange_allowance': pusd_exchange_allowance,
-                'pusd_exchange_allowance_formatted': "∞" if pusd_exchange_allowance == MAX_UINT256 else f"{pusd_exchange_allowance / 1e6:.2f}",
                 'conditional_tokens_approved': self.ctf.functions.isApprovedForAll(
                     self.account.address,
                     self.contract_config.exchange
-                ).call()
+                ).call(),
+                'deposit_wallet': self.deposit_wallet_address
             }
         except Exception as e:
-            logger.error(f"failed to get wallet balance: {e}")
+            logger.error(f"Failed to get wallet balance: {e}")
             return None

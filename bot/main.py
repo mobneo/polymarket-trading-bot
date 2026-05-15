@@ -105,8 +105,8 @@ async def show_hourly_btc(message: Message):
             return
 
         # Get pUSD balance to show available funds
-        balance_info = client.get_wallet_balance()
-        platform_balance = balance_info.get('platform_balance_formatted', 0) if balance_info else 0
+        # balance_info = client.get_wallet_balance()
+        # platform_balance = balance_info.get('platform_balance_formatted', 0) if balance_info else 0
 
         text = (
             f"📈 <b>Bitcoin Up or Down - Hourly</b>\n\n"
@@ -117,7 +117,7 @@ async def show_hourly_btc(message: Message):
             f"   🟢 <b>YES</b> - Bid: {float(market_info['yes_bid']):.4f} / Ask: {float(market_info['yes_ask']):.4f}\n"
             f"   🔴 <b>NO</b>  - Bid: {float(market_info['no_bid']):.4f} / Ask: {float(market_info['no_ask']):.4f}\n\n"
             f"💰 <b>Last Price:</b> {float(market_info['last_trade_price']):.4f}\n\n"
-            f"💳 <b>Available Platform Balance:</b> {platform_balance:.2f} pUSD\n\n"
+            # f"💳 <b>Available Platform Balance:</b> {platform_balance:.2f} pUSD\n\n"
             f"💡 <i>Click buttons below to place orders</i>"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=get_hourly_market_keyboard())
@@ -963,6 +963,7 @@ async def process_size(message: Message, state: FSMContext):
 
 def main():
     logger.info("Starting Polymarket Trading Bot...")
+    # asyncio.run(bot.delete_webhook(drop_pending_updates=True))
     asyncio.run(dp.start_polling(bot))
 
 

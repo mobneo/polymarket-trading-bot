@@ -87,12 +87,12 @@ def get_hourly_market_keyboard():
     """Inline keyboard for the hourly BTC market."""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🟢 Buy YES", callback_data="hourly_buy_yes"),
-            InlineKeyboardButton(text="🔴 Sell YES", callback_data="hourly_sell_yes"),
+            InlineKeyboardButton(text="🟢 Long", callback_data="hourly_buy_yes"),
+            InlineKeyboardButton(text="🔴 Short", callback_data="hourly_buy_no"),
         ],
         [
-            InlineKeyboardButton(text="🟢 Buy NO", callback_data="hourly_buy_no"),
-            InlineKeyboardButton(text="🔴 Sell NO", callback_data="hourly_sell_no"),
+            # InlineKeyboardButton(text="🟢 Buy Down", callback_data="hourly_buy_no"),
+            # InlineKeyboardButton(text="🔴 Sell Up", callback_data="hourly_sell_yes"),
         ],
         [
             InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_hourly_market"),
