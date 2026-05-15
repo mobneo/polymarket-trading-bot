@@ -59,7 +59,6 @@ class PolymarketClient:
         # Initialize relayer client for deposit wallet
         self.relayer = self._init_relayer_client()
 
-        # Get deposit wallet address - используем правильный метод
         self.deposit_wallet_address = self._get_or_deploy_deposit_wallet()
         logger.info(f"Deposit Wallet Address: {self.deposit_wallet_address}")
 
@@ -181,8 +180,6 @@ class PolymarketClient:
             logger.warning("Proxy contract not deployed! Deploying now...")
             self._get_or_deploy_deposit_wallet()
 
-        # --- 2. Очистка старых API ключей ---
-        # Создаем "чистый" клиент для администрирования ключей
         admin_client = ClobClient(
             host=proxy_url,
             chain_id=self.chain_id,
@@ -190,7 +187,6 @@ class PolymarketClient:
         )
 
         try:
-            # Получаем список существующих ключей
             existing_keys = admin_client.get_api_keys()
             if existing_keys and hasattr(existing_keys, 'api_keys'):
                 for key_info in existing_keys.api_keys:
@@ -201,8 +197,6 @@ class PolymarketClient:
             # Если ключей нет, просто логируем ошибку
             logger.info(f"No existing keys to delete or error: {e}")
 
-        # --- 3. Создание НОВОГО API ключа с funder = deposit wallet ---
-        # Создаем временный клиент для генерации ключа
         temp_client = ClobClient(
             host=proxy_url,
             chain_id=self.chain_id,
@@ -212,14 +206,12 @@ class PolymarketClient:
         )
 
         try:
-            # Генерируем ключ. Он должен привязаться к deposit_wallet_address!
             creds = temp_client.create_or_derive_api_key()
             logger.info(f"SUCCESS: New API Key created for deposit wallet: {self.deposit_wallet_address}")
         except Exception as e:
             logger.error(f"Failed to create new API key: {e}")
             raise
 
-        # --- 4. Инициализация основного клиента с новым ключом ---
         client = ClobClient(
             host=proxy_url,
             chain_id=self.chain_id,
@@ -229,19 +221,16 @@ class PolymarketClient:
             funder=self.deposit_wallet_address,
         )
 
-        # --- 5. Проверка работоспособности ---
         ok = client.get_ok()
         logger.info(f"Health check: {ok}")
         if ok != "OK":
             raise Exception("CLOB server health check failed")
 
-        # Важно: Проверяем, что баланс можно получить, что подтвердит правильность настройки
         try:
             balance = client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
             logger.info("Balance check successful - authentication is working!")
         except Exception as e:
             logger.error(f"CRITICAL: Balance check failed even after key reset. Error: {e}")
-            # Это может указывать, что deposit wallet не синхронизирован или не имеет средств.
 
         return client
 
